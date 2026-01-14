@@ -1,4 +1,5 @@
 # Database files used for testing
 *.db
+dist/
 
 node_modules/

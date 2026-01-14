@@ -173,11 +173,13 @@ async function readRightmostPointer(fileHandler: FileHandle, pageOffset: number,
 }
 
 // Read cell pointer array
-async function readCellPointers(fileHandler: FileHandle, pageOffset: number, isPage1: boolean, cellCount: number): Promise<number[]> {
+async function readCellPointers(fileHandler: FileHandle, pageOffset: number, isPage1: boolean, cellCount: number, isInterior: boolean = false): Promise<number[]> {
     const headerOffset = isPage1 ? 100 : 0;
+    // Interior pages have 4-byte rightmost pointer at offset 8-11, so cell array starts at 12
+    const cellArrayOffset = isInterior ? 12 : 8;
     const arraySize = cellCount * 2;
     const buffer = new Uint8Array(arraySize);
-    await fileHandler.read(buffer, 0, arraySize, pageOffset + headerOffset + 8);
+    await fileHandler.read(buffer, 0, arraySize, pageOffset + headerOffset + cellArrayOffset);
     
     const view = new DataView(buffer.buffer);
     const pointers: number[] = [];
@@ -236,7 +238,7 @@ async function readTableCellsRecursive(fileHandler: FileHandle, pageSize: number
     if (pageType === 0x0d) {
         // Leaf page - read all cells
         const cellCount = await readPageHeader(fileHandler, pageOffset, isPage1);
-        const cellPointers = await readCellPointers(fileHandler, pageOffset, isPage1, cellCount);
+        const cellPointers = await readCellPointers(fileHandler, pageOffset, isPage1, cellCount, false);
         
         for (const cellOffset of cellPointers) {
             const cellBuffer = await readCell(fileHandler, pageOffset, cellOffset);
@@ -246,15 +248,15 @@ async function readTableCellsRecursive(fileHandler: FileHandle, pageSize: number
     } else if (pageType === 0x05) {
         // Interior page - traverse children
         const cellCount = await readPageHeader(fileHandler, pageOffset, isPage1);
-        const cellPointers = await readCellPointers(fileHandler, pageOffset, isPage1, cellCount);
+        const cellPointers = await readCellPointers(fileHandler, pageOffset, isPage1, cellCount, true);
         
         // Read each cell to get left child pointers
         for (const cellOffset of cellPointers) {
             const cellBuffer = new Uint8Array(16);
             await fileHandler.read(cellBuffer, 0, 16, pageOffset + cellOffset);
             
-            // First 4 bytes of interior cell is the left child page number
-            const leftChildPage = new DataView(cellBuffer.buffer).getUint32(0);
+            // First 4 bytes of interior cell is the left child page number (big-endian)
+            const leftChildPage = new DataView(cellBuffer.buffer).getUint32(0, false); // false = big-endian
             await readTableCellsRecursive(fileHandler, pageSize, leftChildPage, rows);
         }
         
@@ -333,12 +335,10 @@ if (command === ".dbinfo") {
     // Find table and get root page
     const { rootPage } = await findTable(databaseFileHandler, tableName);
     
-    // Count cells on the root page
-    const pageOffset = (rootPage - 1) * pageSize;
-    const isPage1 = rootPage === 1;
-    const rowCount = await readPageHeader(databaseFileHandler, pageOffset, isPage1);
+    // Read all rows from the table and count them
+    const rows = await readTableCells(databaseFileHandler, pageSize, rootPage);
     
-    console.log(rowCount);
+    console.log(rows.length);
     await databaseFileHandler.close();
 
 } else if (command.toUpperCase().startsWith("SELECT") && !command.toUpperCase().includes("COUNT(*)")) {
