@@ -88,9 +88,54 @@ function parseRecord(buffer: Uint8Array): string[] {
     const values: string[] = [];
     for (const serialType of serialTypes) {
         const size = getSerialTypeSize(serialType);
-        const value = new TextDecoder().decode(buffer.slice(offset, offset + size));
-        values.push(value);
-        offset += size;
+        
+        // Handle different data types based on serial type
+        if (serialType === 0) {
+            // NULL
+            values.push('');
+        } else if (serialType === 8) {
+            // Integer constant 0
+            values.push('0');
+        } else if (serialType === 9) {
+            // Integer constant 1
+            values.push('1');
+        } else if (serialType >= 1 && serialType <= 6) {
+            // Integer (1-6 bytes)
+            const view = new DataView(buffer.buffer, buffer.byteOffset + offset, size);
+            let intValue = 0;
+            
+            if (size === 1) {
+                intValue = view.getInt8(0);
+            } else if (size === 2) {
+                intValue = view.getInt16(0, false); // big-endian
+            } else if (size === 3) {
+                // 24-bit integer - read manually
+                intValue = (view.getInt8(0) << 16) | (view.getUint8(1) << 8) | view.getUint8(2);
+            } else if (size === 4) {
+                intValue = view.getInt32(0, false); // big-endian
+            } else if (size === 6) {
+                // 48-bit integer - read as two parts
+                const high = view.getInt16(0, false);
+                const low = view.getUint32(2, false);
+                intValue = (high * 0x100000000) + low;
+            } else if (size === 8) {
+                intValue = Number(view.getBigInt64(0, false));
+            }
+            
+            values.push(intValue.toString());
+            offset += size;
+        } else if (serialType === 7) {
+            // Float
+            const view = new DataView(buffer.buffer, buffer.byteOffset + offset, 8);
+            const floatValue = view.getFloat64(0, false); // big-endian
+            values.push(floatValue.toString());
+            offset += size;
+        } else {
+            // TEXT or BLOB - decode as text
+            const value = new TextDecoder().decode(buffer.slice(offset, offset + size));
+            values.push(value);
+            offset += size;
+        }
     }
     
     return values;
