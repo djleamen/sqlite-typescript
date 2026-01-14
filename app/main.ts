@@ -453,14 +453,13 @@ async function fetchRowByRowidRecursive(fileHandler: FileHandle, pageSize: numbe
             let offset = 4; // Skip left child pointer
             const [key, keyBytes] = readVarint(cellBuffer, offset);
             
-            if (targetRowid < key) {
-                // Target is in the left subtree
-                const result = await fetchRowByRowidRecursive(fileHandler, pageSize, leftChildPage, targetRowid);
-                if (result) return result;
+            if (targetRowid <= key) {
+                // Target is in the left subtree (including equal case)
+                return await fetchRowByRowidRecursive(fileHandler, pageSize, leftChildPage, targetRowid);
             }
         }
         
-        // If not found in any left subtree, check rightmost child
+        // If target is greater than all keys, check rightmost child
         const rightmostChild = await readRightmostPointer(fileHandler, pageOffset, isPage1);
         return await fetchRowByRowidRecursive(fileHandler, pageSize, rightmostChild, targetRowid);
     }
