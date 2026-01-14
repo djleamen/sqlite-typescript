@@ -219,14 +219,14 @@ async function findTable(fileHandler: FileHandle, tableName: string, includeSql:
 }
 
 // Read all cells from a table page
-async function readTableCells(fileHandler: FileHandle, pageSize: number, rootPage: number): Promise<string[][]> {
-    const rows: string[][] = [];
+async function readTableCells(fileHandler: FileHandle, pageSize: number, rootPage: number): Promise<Array<{ rowid: number, values: string[] }>> {
+    const rows: Array<{ rowid: number, values: string[] }> = [];
     await readTableCellsRecursive(fileHandler, pageSize, rootPage, rows);
     return rows;
 }
 
 // Recursive helper to traverse B-tree and collect all rows
-async function readTableCellsRecursive(fileHandler: FileHandle, pageSize: number, pageNum: number, rows: string[][]): Promise<void> {
+async function readTableCellsRecursive(fileHandler: FileHandle, pageSize: number, pageNum: number, rows: Array<{ rowid: number, values: string[] }>): Promise<void> {
     const pageOffset = (pageNum - 1) * pageSize;
     const isPage1 = pageNum === 1;
     
@@ -240,8 +240,8 @@ async function readTableCellsRecursive(fileHandler: FileHandle, pageSize: number
         
         for (const cellOffset of cellPointers) {
             const cellBuffer = await readCell(fileHandler, pageOffset, cellOffset);
-            const { rowid, values } = parseRecord(cellBuffer);
-            rows.push(values);
+            const record = parseRecord(cellBuffer);
+            rows.push(record);
         }
     } else if (pageType === 0x05) {
         // Interior page - traverse children
@@ -264,8 +264,8 @@ async function readTableCellsRecursive(fileHandler: FileHandle, pageSize: number
     }
 }
 
-// Parse CREATE TABLE to extract column names
-function parseCreateTable(sql: string): string[] {
+// Parse CREATE TABLE to extract column names and identify INTEGER PRIMARY KEY
+function parseCreateTable(sql: string): { columns: string[], integerPrimaryKeyColumn: string | null } {
     const columnsMatch = sql.match(/\(([^)]+)\)/s);
     if (!columnsMatch) {
         throw new Error("Failed to parse CREATE TABLE statement");
@@ -273,7 +273,21 @@ function parseCreateTable(sql: string): string[] {
     
     const columnsText = columnsMatch[1];
     const columnDefs = columnsText.split(',').map(col => col.trim());
-    return columnDefs.map(def => def.split(/\s+/)[0].trim());
+    const columns: string[] = [];
+    let integerPrimaryKeyColumn: string | null = null;
+    
+    for (const def of columnDefs) {
+        const colName = def.split(/\s+/)[0].trim();
+        columns.push(colName);
+        
+        // Check if this is an INTEGER PRIMARY KEY column
+        const upperDef = def.toUpperCase();
+        if (upperDef.includes('INTEGER') && upperDef.includes('PRIMARY') && upperDef.includes('KEY')) {
+            integerPrimaryKeyColumn = colName;
+        }
+    }
+    
+    return { columns, integerPrimaryKeyColumn };
 }
 
 if (command === ".dbinfo") {
@@ -358,8 +372,8 @@ if (command === ".dbinfo") {
     // Find table and get CREATE TABLE SQL
     const { rootPage, sql } = await findTable(databaseFileHandler, tableName, true);
     
-    // Parse CREATE TABLE to find column indices
-    const columns = parseCreateTable(sql!);
+    // Parse CREATE TABLE to find column indices and INTEGER PRIMARY KEY
+    const { columns, integerPrimaryKeyColumn } = parseCreateTable(sql!);
     const columnIndices = columnNames.map(name => {
         const index = columns.indexOf(name);
         if (index === -1) {
@@ -368,13 +382,18 @@ if (command === ".dbinfo") {
         return index;
     });
     
+    // Check which columns are INTEGER PRIMARY KEY (use rowid instead of values array)
+    const useRowidForColumn = columnNames.map(name => name === integerPrimaryKeyColumn);
+    
     // Find WHERE column index if present
     let whereColumnIndex = -1;
+    let whereUsesRowid = false;
     if (whereColumn) {
         whereColumnIndex = columns.indexOf(whereColumn);
         if (whereColumnIndex === -1) {
             throw new Error(`Column ${whereColumn} not found in table ${tableName}`);
         }
+        whereUsesRowid = whereColumn === integerPrimaryKeyColumn;
     }
     
     // Read all rows from the table
@@ -383,11 +402,20 @@ if (command === ".dbinfo") {
     // Filter and print the requested columns
     rows.forEach(row => {
         // Apply WHERE filter if present
-        if (whereColumn && whereValue && row[whereColumnIndex] !== whereValue) {
-            return;
+        if (whereColumn && whereValue) {
+            const actualValue = whereUsesRowid ? row.rowid.toString() : row.values[whereColumnIndex];
+            if (actualValue !== whereValue) {
+                return;
+            }
         }
         
-        const values = columnIndices.map(idx => row[idx]);
+        const values = columnIndices.map((idx, i) => {
+            // If this column is INTEGER PRIMARY KEY, use rowid instead of values array
+            if (useRowidForColumn[i]) {
+                return row.rowid.toString();
+            }
+            return row.values[idx];
+        });
         console.log(values.join('|'));
     });
     
