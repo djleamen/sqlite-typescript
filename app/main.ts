@@ -99,9 +99,25 @@ function parseRecord(buffer: Uint8Array): string[] {
 // Read page header and return cell count
 async function readPageHeader(fileHandler: FileHandle, pageOffset: number, isPage1: boolean): Promise<number> {
     const headerOffset = isPage1 ? 100 : 0;
-    const buffer = new Uint8Array(8);
-    await fileHandler.read(buffer, 0, 8, pageOffset + headerOffset);
+    const buffer = new Uint8Array(12);
+    await fileHandler.read(buffer, 0, 12, pageOffset + headerOffset);
     return new DataView(buffer.buffer).getUint16(3);
+}
+
+// Read page type from page header
+async function readPageType(fileHandler: FileHandle, pageOffset: number, isPage1: boolean): Promise<number> {
+    const headerOffset = isPage1 ? 100 : 0;
+    const buffer = new Uint8Array(1);
+    await fileHandler.read(buffer, 0, 1, pageOffset + headerOffset);
+    return buffer[0];
+}
+
+// Read rightmost pointer from interior page header
+async function readRightmostPointer(fileHandler: FileHandle, pageOffset: number, isPage1: boolean): Promise<number> {
+    const headerOffset = isPage1 ? 100 : 0;
+    const buffer = new Uint8Array(12);
+    await fileHandler.read(buffer, 0, 12, pageOffset + headerOffset);
+    return new DataView(buffer.buffer).getUint32(8);
 }
 
 // Read cell pointer array
@@ -152,19 +168,47 @@ async function findTable(fileHandler: FileHandle, tableName: string, includeSql:
 
 // Read all cells from a table page
 async function readTableCells(fileHandler: FileHandle, pageSize: number, rootPage: number): Promise<string[][]> {
-    const pageOffset = (rootPage - 1) * pageSize;
-    const isPage1 = rootPage === 1;
-    
-    const cellCount = await readPageHeader(fileHandler, pageOffset, isPage1);
-    const cellPointers = await readCellPointers(fileHandler, pageOffset, isPage1, cellCount);
-    
     const rows: string[][] = [];
-    for (const cellOffset of cellPointers) {
-        const cellBuffer = await readCell(fileHandler, pageOffset, cellOffset);
-        rows.push(parseRecord(cellBuffer));
-    }
-    
+    await readTableCellsRecursive(fileHandler, pageSize, rootPage, rows);
     return rows;
+}
+
+// Recursive helper to traverse B-tree and collect all rows
+async function readTableCellsRecursive(fileHandler: FileHandle, pageSize: number, pageNum: number, rows: string[][]): Promise<void> {
+    const pageOffset = (pageNum - 1) * pageSize;
+    const isPage1 = pageNum === 1;
+    
+    // Check page type (0x0d = leaf, 0x05 = interior)
+    const pageType = await readPageType(fileHandler, pageOffset, isPage1);
+    
+    if (pageType === 0x0d) {
+        // Leaf page - read all cells
+        const cellCount = await readPageHeader(fileHandler, pageOffset, isPage1);
+        const cellPointers = await readCellPointers(fileHandler, pageOffset, isPage1, cellCount);
+        
+        for (const cellOffset of cellPointers) {
+            const cellBuffer = await readCell(fileHandler, pageOffset, cellOffset);
+            rows.push(parseRecord(cellBuffer));
+        }
+    } else if (pageType === 0x05) {
+        // Interior page - traverse children
+        const cellCount = await readPageHeader(fileHandler, pageOffset, isPage1);
+        const cellPointers = await readCellPointers(fileHandler, pageOffset, isPage1, cellCount);
+        
+        // Read each cell to get left child pointers
+        for (const cellOffset of cellPointers) {
+            const cellBuffer = new Uint8Array(16);
+            await fileHandler.read(cellBuffer, 0, 16, pageOffset + cellOffset);
+            
+            // First 4 bytes of interior cell is the left child page number
+            const leftChildPage = new DataView(cellBuffer.buffer).getUint32(0);
+            await readTableCellsRecursive(fileHandler, pageSize, leftChildPage, rows);
+        }
+        
+        // Read the rightmost child pointer
+        const rightmostChild = await readRightmostPointer(fileHandler, pageOffset, isPage1);
+        await readTableCellsRecursive(fileHandler, pageSize, rightmostChild, rows);
+    }
 }
 
 // Parse CREATE TABLE to extract column names
