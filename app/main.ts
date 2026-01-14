@@ -234,11 +234,22 @@ if (command === ".dbinfo") {
     const parts = command.split(/\s+/);
     const selectIndex = parts.findIndex(p => p.toUpperCase() === "SELECT");
     const fromIndex = parts.findIndex(p => p.toUpperCase() === "FROM");
+    const whereIndex = parts.findIndex(p => p.toUpperCase() === "WHERE");
     
     // Extract column names (may be comma-separated)
     const columnsStr = parts.slice(selectIndex + 1, fromIndex).join(' ');
     const columnNames = columnsStr.split(',').map(c => c.trim());
     const tableName = parts[fromIndex + 1];
+    
+    // Parse WHERE clause if present
+    let whereColumn: string | null = null;
+    let whereValue: string | null = null;
+    if (whereIndex !== -1) {
+        whereColumn = parts[whereIndex + 1];
+        const valueStartIndex = whereIndex + 3; // WHERE column = value
+        const rawValue = parts.slice(valueStartIndex).join(' ');
+        whereValue = rawValue.replace(/^['"]|['"]$/g, ''); // Remove surrounding quotes
+    }
     
     const databaseFileHandler = await open(databaseFilePath, constants.O_RDONLY);
     
@@ -260,11 +271,25 @@ if (command === ".dbinfo") {
         return index;
     });
     
+    // Find WHERE column index if present
+    let whereColumnIndex = -1;
+    if (whereColumn) {
+        whereColumnIndex = columns.indexOf(whereColumn);
+        if (whereColumnIndex === -1) {
+            throw new Error(`Column ${whereColumn} not found in table ${tableName}`);
+        }
+    }
+    
     // Read all rows from the table
     const rows = await readTableCells(databaseFileHandler, pageSize, rootPage);
     
-    // Extract and print the requested columns
+    // Filter and print the requested columns
     rows.forEach(row => {
+        // Apply WHERE filter if present
+        if (whereColumn && whereValue && row[whereColumnIndex] !== whereValue) {
+            return;
+        }
+        
         const values = columnIndices.map(idx => row[idx]);
         console.log(values.join('|'));
     });
