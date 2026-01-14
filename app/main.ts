@@ -105,21 +105,21 @@ function parseRecord(buffer: Uint8Array): string[] {
             let intValue = 0;
             
             if (size === 1) {
-                intValue = view.getInt8(0);
+                intValue = buffer[offset];
             } else if (size === 2) {
-                intValue = view.getInt16(0, false); // big-endian
+                intValue = view.getUint16(0, false); // big-endian unsigned
             } else if (size === 3) {
-                // 24-bit integer - read manually
-                intValue = (view.getInt8(0) << 16) | (view.getUint8(1) << 8) | view.getUint8(2);
+                // 24-bit integer - read as unsigned
+                intValue = (buffer[offset] << 16) | (buffer[offset + 1] << 8) | buffer[offset + 2];
             } else if (size === 4) {
-                intValue = view.getInt32(0, false); // big-endian
+                intValue = view.getUint32(0, false); // big-endian unsigned
             } else if (size === 6) {
-                // 48-bit integer - read as two parts
-                const high = view.getInt16(0, false);
+                // 48-bit integer - read as unsigned
+                const high = view.getUint16(0, false);
                 const low = view.getUint32(2, false);
                 intValue = (high * 0x100000000) + low;
             } else if (size === 8) {
-                intValue = Number(view.getBigInt64(0, false));
+                intValue = Number(view.getBigUint64(0, false));
             }
             
             values.push(intValue.toString());
