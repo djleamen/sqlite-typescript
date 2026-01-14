@@ -59,15 +59,15 @@ function getSerialTypeSize(serialType: number): number {
     return 0;
 }
 
-// Parse a record and return column values
-function parseRecord(buffer: Uint8Array): string[] {
+// Parse a record and return column values (also return rowid)
+function parseRecord(buffer: Uint8Array): { rowid: number, values: string[] } {
     let offset = 0;
     
     // Skip record size
     const [recordSize, recordSizeBytes] = readVarint(buffer, offset);
     offset += recordSizeBytes;
     
-    // Skip rowid
+    // Read rowid (we'll need this)
     const [rowid, rowidBytes] = readVarint(buffer, offset);
     offset += rowidBytes;
     
@@ -100,26 +100,33 @@ function parseRecord(buffer: Uint8Array): string[] {
             // Integer constant 1
             values.push('1');
         } else if (serialType >= 1 && serialType <= 6) {
-            // Integer (1-6 bytes)
+            // Integer (1-6 bytes) - SQLite uses big-endian twos-complement
             const view = new DataView(buffer.buffer, buffer.byteOffset + offset, size);
             let intValue = 0;
             
             if (size === 1) {
-                intValue = buffer[offset];
+                intValue = view.getInt8(0);
             } else if (size === 2) {
-                intValue = view.getUint16(0, false); // big-endian unsigned
+                intValue = view.getInt16(0, false); // big-endian
             } else if (size === 3) {
-                // 24-bit integer - read as unsigned
-                intValue = (buffer[offset] << 16) | (buffer[offset + 1] << 8) | buffer[offset + 2];
+                // 24-bit signed integer
+                const byte0 = buffer[offset];
+                const byte1 = buffer[offset + 1];
+                const byte2 = buffer[offset + 2];
+                intValue = (byte0 << 16) | (byte1 << 8) | byte2;
+                // Sign extend if negative
+                if (intValue & 0x800000) {
+                    intValue |= 0xFF000000;
+                }
             } else if (size === 4) {
-                intValue = view.getUint32(0, false); // big-endian unsigned
+                intValue = view.getInt32(0, false); // big-endian
             } else if (size === 6) {
-                // 48-bit integer - read as unsigned
-                const high = view.getUint16(0, false);
+                // 48-bit signed integer
+                const high = view.getInt16(0, false);
                 const low = view.getUint32(2, false);
                 intValue = (high * 0x100000000) + low;
             } else if (size === 8) {
-                intValue = Number(view.getBigUint64(0, false));
+                intValue = Number(view.getBigInt64(0, false));
             }
             
             values.push(intValue.toString());
@@ -138,7 +145,7 @@ function parseRecord(buffer: Uint8Array): string[] {
         }
     }
     
-    return values;
+    return { rowid, values };
 }
 
 // Read page header and return cell count
@@ -194,7 +201,7 @@ async function findTable(fileHandler: FileHandle, tableName: string, includeSql:
     
     for (const cellOffset of cellPointers) {
         const cellBuffer = await readCell(fileHandler, 0, cellOffset);
-        const values = parseRecord(cellBuffer);
+        const { values } = parseRecord(cellBuffer);
         
         // values: [type, name, tbl_name, rootpage, sql]
         if (values[2] === tableName) {
@@ -233,7 +240,8 @@ async function readTableCellsRecursive(fileHandler: FileHandle, pageSize: number
         
         for (const cellOffset of cellPointers) {
             const cellBuffer = await readCell(fileHandler, pageOffset, cellOffset);
-            rows.push(parseRecord(cellBuffer));
+            const { rowid, values } = parseRecord(cellBuffer);
+            rows.push(values);
         }
     } else if (pageType === 0x05) {
         // Interior page - traverse children
@@ -292,7 +300,7 @@ if (command === ".dbinfo") {
     const tableNames: string[] = [];
     for (const cellOffset of cellPointers) {
         const cellBuffer = await readCell(databaseFileHandler, 0, cellOffset);
-        const values = parseRecord(cellBuffer);
+        const { values } = parseRecord(cellBuffer);
         tableNames.push(values[2]); // tbl_name is column 2
     }
     
