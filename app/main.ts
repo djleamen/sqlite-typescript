@@ -199,7 +199,7 @@ async function findTable(fileHandler: FileHandle, tableName: string, includeSql:
         // values: [type, name, tbl_name, rootpage, sql]
         if (values[2] === tableName) {
             const result: { rootPage: number, sql?: string } = {
-                rootPage: values[3].charCodeAt(0)
+                rootPage: parseInt(values[3])
             };
             if (includeSql) {
                 result.sql = values[4];
