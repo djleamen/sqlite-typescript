@@ -220,6 +220,24 @@ async function findTable(fileHandler: FileHandle, tableName: string, includeSql:
     throw new Error(`Table ${tableName} not found`);
 }
 
+// Find index in sqlite_schema and return rootpage
+async function findIndex(fileHandler: FileHandle, indexName: string): Promise<number> {
+    const cellCount = await readPageHeader(fileHandler, 0, true);
+    const cellPointers = await readCellPointers(fileHandler, 0, true, cellCount);
+    
+    for (const cellOffset of cellPointers) {
+        const cellBuffer = await readCell(fileHandler, 0, cellOffset);
+        const { values } = parseRecord(cellBuffer);
+        
+        // values: [type, name, tbl_name, rootpage, sql]
+        if (values[0] === 'index' && values[1] === indexName) {
+            return parseInt(values[3]);
+        }
+    }
+    
+    throw new Error(`Index ${indexName} not found`);
+}
+
 // Read all cells from a table page
 async function readTableCells(fileHandler: FileHandle, pageSize: number, rootPage: number): Promise<Array<{ rowid: number, values: string[] }>> {
     const rows: Array<{ rowid: number, values: string[] }> = [];
@@ -264,6 +282,190 @@ async function readTableCellsRecursive(fileHandler: FileHandle, pageSize: number
         const rightmostChild = await readRightmostPointer(fileHandler, pageOffset, isPage1);
         await readTableCellsRecursive(fileHandler, pageSize, rightmostChild, rows);
     }
+}
+
+// Scan index for matching values and return rowids
+async function scanIndex(fileHandler: FileHandle, pageSize: number, rootPage: number, searchValue: string): Promise<number[]> {
+    const rowids: number[] = [];
+    await scanIndexRecursive(fileHandler, pageSize, rootPage, searchValue, rowids);
+    return rowids;
+}
+
+// Recursive helper to traverse index B-tree and find matching entries
+async function scanIndexRecursive(fileHandler: FileHandle, pageSize: number, pageNum: number, searchValue: string, rowids: number[]): Promise<void> {
+    const pageOffset = (pageNum - 1) * pageSize;
+    const isPage1 = pageNum === 1;
+    
+    // Check page type (0x0a = index leaf, 0x02 = index interior)
+    const pageType = await readPageType(fileHandler, pageOffset, isPage1);
+    
+    if (pageType === 0x0a) {
+        // Index leaf page - read all cells and check for matches
+        const cellCount = await readPageHeader(fileHandler, pageOffset, isPage1);
+        const cellPointers = await readCellPointers(fileHandler, pageOffset, isPage1, cellCount, false);
+        
+        for (const cellOffset of cellPointers) {
+            const cellBuffer = await readCell(fileHandler, pageOffset, cellOffset);
+            
+            // Parse index entry: it's a record with indexed value(s) + rowid
+            let offset = 0;
+            
+            // Read payload size
+            const [payloadSize, payloadSizeBytes] = readVarint(cellBuffer, offset);
+            offset += payloadSizeBytes;
+            
+            // Read header size
+            const [headerSize, headerSizeBytes] = readVarint(cellBuffer, offset);
+            offset += headerSizeBytes;
+            
+            // Read serial types
+            const serialTypes: number[] = [];
+            const headerStart = offset - headerSizeBytes;
+            while (offset - headerStart < headerSize) {
+                const [serialType, serialTypeBytes] = readVarint(cellBuffer, offset);
+                serialTypes.push(serialType);
+                offset += serialTypeBytes;
+            }
+            
+            // Read values - for a single-column index, we have: [indexed_value, rowid]
+            const values: string[] = [];
+            for (const serialType of serialTypes) {
+                const size = getSerialTypeSize(serialType);
+                
+                if (serialType === 0) {
+                    values.push('');
+                } else if (serialType === 8) {
+                    values.push('0');
+                } else if (serialType === 9) {
+                    values.push('1');
+                } else if (serialType >= 1 && serialType <= 6) {
+                    // Integer
+                    const view = new DataView(cellBuffer.buffer, cellBuffer.byteOffset + offset, size);
+                    let intValue = 0;
+                    
+                    if (size === 1) {
+                        intValue = view.getInt8(0);
+                    } else if (size === 2) {
+                        intValue = view.getInt16(0, false);
+                    } else if (size === 3) {
+                        const byte0 = cellBuffer[offset];
+                        const byte1 = cellBuffer[offset + 1];
+                        const byte2 = cellBuffer[offset + 2];
+                        intValue = (byte0 << 16) | (byte1 << 8) | byte2;
+                        if (intValue & 0x800000) {
+                            intValue |= 0xFF000000;
+                        }
+                    } else if (size === 4) {
+                        intValue = view.getInt32(0, false);
+                    } else if (size === 6) {
+                        const high = view.getInt16(0, false);
+                        const low = view.getUint32(2, false);
+                        intValue = (high * 0x100000000) + low;
+                    } else if (size === 8) {
+                        intValue = Number(view.getBigInt64(0, false));
+                    }
+                    
+                    values.push(intValue.toString());
+                    offset += size;
+                } else if (serialType === 7) {
+                    const view = new DataView(cellBuffer.buffer, cellBuffer.byteOffset + offset, 8);
+                    const floatValue = view.getFloat64(0, false);
+                    values.push(floatValue.toString());
+                    offset += size;
+                } else {
+                    // TEXT or BLOB
+                    const value = new TextDecoder().decode(cellBuffer.slice(offset, offset + size));
+                    values.push(value);
+                    offset += size;
+                }
+            }
+            
+            // First value is the indexed column, last value is the rowid
+            if (values.length >= 2) {
+                const indexedValue = values[0];
+                const rowid = parseInt(values[values.length - 1]);
+                
+                if (indexedValue === searchValue) {
+                    rowids.push(rowid);
+                }
+            }
+        }
+    } else if (pageType === 0x02) {
+        // Index interior page - for now, traverse all children (not implementing binary search)
+        const cellCount = await readPageHeader(fileHandler, pageOffset, isPage1);
+        const cellPointers = await readCellPointers(fileHandler, pageOffset, isPage1, cellCount, true);
+        
+        // Read each cell to get left child pointers
+        for (const cellOffset of cellPointers) {
+            const cellBuffer = new Uint8Array(16);
+            await fileHandler.read(cellBuffer, 0, 16, pageOffset + cellOffset);
+            
+            const leftChildPage = new DataView(cellBuffer.buffer).getUint32(0, false);
+            await scanIndexRecursive(fileHandler, pageSize, leftChildPage, searchValue, rowids);
+        }
+        
+        // Read the rightmost child pointer
+        const rightmostChild = await readRightmostPointer(fileHandler, pageOffset, isPage1);
+        await scanIndexRecursive(fileHandler, pageSize, rightmostChild, searchValue, rowids);
+    }
+}
+
+// Fetch a specific row by rowid from a table
+async function fetchRowByRowid(fileHandler: FileHandle, pageSize: number, rootPage: number, targetRowid: number): Promise<{ rowid: number, values: string[] } | null> {
+    return await fetchRowByRowidRecursive(fileHandler, pageSize, rootPage, targetRowid);
+}
+
+// Recursive helper to find a row by rowid in the table B-tree
+async function fetchRowByRowidRecursive(fileHandler: FileHandle, pageSize: number, pageNum: number, targetRowid: number): Promise<{ rowid: number, values: string[] } | null> {
+    const pageOffset = (pageNum - 1) * pageSize;
+    const isPage1 = pageNum === 1;
+    
+    const pageType = await readPageType(fileHandler, pageOffset, isPage1);
+    
+    if (pageType === 0x0d) {
+        // Leaf page - search for the rowid
+        const cellCount = await readPageHeader(fileHandler, pageOffset, isPage1);
+        const cellPointers = await readCellPointers(fileHandler, pageOffset, isPage1, cellCount, false);
+        
+        for (const cellOffset of cellPointers) {
+            const cellBuffer = await readCell(fileHandler, pageOffset, cellOffset);
+            const record = parseRecord(cellBuffer);
+            
+            if (record.rowid === targetRowid) {
+                return record;
+            }
+        }
+        
+        return null;
+    } else if (pageType === 0x05) {
+        // Interior page - traverse to find the right child
+        const cellCount = await readPageHeader(fileHandler, pageOffset, isPage1);
+        const cellPointers = await readCellPointers(fileHandler, pageOffset, isPage1, cellCount, true);
+        
+        // Check each cell to find the right branch
+        for (const cellOffset of cellPointers) {
+            const cellBuffer = new Uint8Array(16);
+            await fileHandler.read(cellBuffer, 0, 16, pageOffset + cellOffset);
+            
+            const leftChildPage = new DataView(cellBuffer.buffer).getUint32(0, false);
+            
+            // Read the key (rowid) from this interior cell
+            let offset = 4; // Skip left child pointer
+            const [key, keyBytes] = readVarint(cellBuffer, offset);
+            
+            if (targetRowid < key) {
+                // Target is in the left subtree
+                const result = await fetchRowByRowidRecursive(fileHandler, pageSize, leftChildPage, targetRowid);
+                if (result) return result;
+            }
+        }
+        
+        // If not found in any left subtree, check rightmost child
+        const rightmostChild = await readRightmostPointer(fileHandler, pageOffset, isPage1);
+        return await fetchRowByRowidRecursive(fileHandler, pageSize, rightmostChild, targetRowid);
+    }
+    
+    return null;
 }
 
 // Parse CREATE TABLE to extract column names and identify INTEGER PRIMARY KEY
@@ -396,13 +598,38 @@ if (command === ".dbinfo") {
         whereUsesRowid = whereColumn === integerPrimaryKeyColumn;
     }
     
-    // Read all rows from the table
-    const rows = await readTableCells(databaseFileHandler, pageSize, rootPage);
+    // Try to use index scan if WHERE clause matches an indexed column
+    let rows: Array<{ rowid: number, values: string[] }> = [];
+    
+    if (whereColumn === 'country' && whereValue) {
+        // Try to find and use the index on country column
+        try {
+            const indexName = `idx_${tableName}_${whereColumn}`;
+            const indexRootPage = await findIndex(databaseFileHandler, indexName);
+            
+            // Scan the index for matching rowids
+            const matchingRowids = await scanIndex(databaseFileHandler, pageSize, indexRootPage, whereValue);
+            
+            // Fetch each matching row by rowid
+            for (const rowid of matchingRowids) {
+                const row = await fetchRowByRowid(databaseFileHandler, pageSize, rootPage, rowid);
+                if (row) {
+                    rows.push(row);
+                }
+            }
+        } catch (e) {
+            // Index not found, fall back to full table scan
+            rows = await readTableCells(databaseFileHandler, pageSize, rootPage);
+        }
+    } else {
+        // No index available, do full table scan
+        rows = await readTableCells(databaseFileHandler, pageSize, rootPage);
+    }
     
     // Filter and print the requested columns
     rows.forEach(row => {
-        // Apply WHERE filter if present
-        if (whereColumn && whereValue) {
+        // Apply WHERE filter if present and we didn't use index scan
+        if (whereColumn && whereValue && whereColumn !== 'country') {
             const actualValue = whereUsesRowid ? row.rowid.toString() : row.values[whereColumnIndex];
             if (actualValue !== whereValue) {
                 return;
