@@ -235,7 +235,9 @@ if (command === ".dbinfo") {
     const selectIndex = parts.findIndex(p => p.toUpperCase() === "SELECT");
     const fromIndex = parts.findIndex(p => p.toUpperCase() === "FROM");
     
-    const columnName = parts[selectIndex + 1];
+    // Extract column names (may be comma-separated)
+    const columnsStr = parts.slice(selectIndex + 1, fromIndex).join(' ');
+    const columnNames = columnsStr.split(',').map(c => c.trim());
     const tableName = parts[fromIndex + 1];
     
     const databaseFileHandler = await open(databaseFilePath, constants.O_RDONLY);
@@ -248,18 +250,24 @@ if (command === ".dbinfo") {
     // Find table and get CREATE TABLE SQL
     const { rootPage, sql } = await findTable(databaseFileHandler, tableName, true);
     
-    // Parse CREATE TABLE to find column index
+    // Parse CREATE TABLE to find column indices
     const columns = parseCreateTable(sql!);
-    const columnIndex = columns.indexOf(columnName);
-    if (columnIndex === -1) {
-        throw new Error(`Column ${columnName} not found in table ${tableName}`);
-    }
+    const columnIndices = columnNames.map(name => {
+        const index = columns.indexOf(name);
+        if (index === -1) {
+            throw new Error(`Column ${name} not found in table ${tableName}`);
+        }
+        return index;
+    });
     
     // Read all rows from the table
     const rows = await readTableCells(databaseFileHandler, pageSize, rootPage);
     
-    // Extract and print the requested column
-    rows.forEach(row => console.log(row[columnIndex]));
+    // Extract and print the requested columns
+    rows.forEach(row => {
+        const values = columnIndices.map(idx => row[idx]);
+        console.log(values.join('|'));
+    });
     
     await databaseFileHandler.close();
 
