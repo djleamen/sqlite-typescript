@@ -135,6 +135,94 @@ if (command === ".dbinfo") {
     console.log(tableNames.join(' '));
     
     await databaseFileHandler.close();
+
+} else if (command.toUpperCase().startsWith("SELECT COUNT(*) FROM")) {
+    // Extract table name (just get the last word for now)
+    const tableName = command.split(' ').pop()!;
+    
+    const databaseFileHandler = await open(databaseFilePath, constants.O_RDONLY);
+    
+    const headerBuffer = new Uint8Array(100);
+    await databaseFileHandler.read(headerBuffer, 0, 100, 0);
+    const pageSize = new DataView(headerBuffer.buffer).getUint16(16);
+    
+    const pageHeaderBuffer = new Uint8Array(8);
+    await databaseFileHandler.read(pageHeaderBuffer, 0, 8, 100);
+    
+    const pageHeaderView = new DataView(pageHeaderBuffer.buffer);
+    const numberOfCells = pageHeaderView.getUint16(3);
+    
+    const cellPointerArraySize = numberOfCells * 2;
+    const cellPointerArrayBuffer = new Uint8Array(cellPointerArraySize);
+    await databaseFileHandler.read(cellPointerArrayBuffer, 0, cellPointerArraySize, 108);
+    
+    const cellPointerArrayView = new DataView(cellPointerArrayBuffer.buffer);
+    let rootPage = 0;
+    
+    for (let i = 0; i < numberOfCells; i++) {
+        const cellOffset = cellPointerArrayView.getUint16(i * 2);
+        
+        const cellBuffer = new Uint8Array(1000);
+        await databaseFileHandler.read(cellBuffer, 0, cellBuffer.length, cellOffset);
+        
+        let offset = 0;
+        const [recordSize, recordSizeBytes] = readVarint(cellBuffer, offset);
+        offset += recordSizeBytes;
+        
+        const [rowid, rowidBytes] = readVarint(cellBuffer, offset);
+        offset += rowidBytes;
+        
+        const [headerSize, headerSizeBytes] = readVarint(cellBuffer, offset);
+        offset += headerSizeBytes;
+        
+        // Read serial types for columns
+        const serialTypes: number[] = [];
+        const headerStart = offset - headerSizeBytes;
+        while (offset - headerStart < headerSize) {
+            const [serialType, serialTypeBytes] = readVarint(cellBuffer, offset);
+            serialTypes.push(serialType);
+            offset += serialTypeBytes;
+        }
+        
+        // Skip type (column 0)
+        const typeSize = getSerialTypeSize(serialTypes[0]);
+        offset += typeSize;
+        
+        // Skip name (column 1)
+        const nameSize = getSerialTypeSize(serialTypes[1]);
+        offset += nameSize;
+        
+        // Read tbl_name (column 2)
+        const tblNameSize = getSerialTypeSize(serialTypes[2]);
+        const tblName = new TextDecoder().decode(cellBuffer.slice(offset, offset + tblNameSize));
+        offset += tblNameSize;
+        
+        // Read rootpage (column 3) - this is a 1-byte integer (serial type 1)
+        if (tblName === tableName) {
+            rootPage = cellBuffer[offset];
+            break;
+        }
+    }
+    
+    if (rootPage === 0) {
+        throw new Error(`Table ${tableName} not found`);
+    }
+    
+    // Navigate to the table's root page and count cells
+    const tablePageOffset = (rootPage - 1) * pageSize;
+    
+    // Read the page header for the table's root page
+    const tablePageHeaderOffset = rootPage === 1 ? 100 : 0;
+    const tablePageHeaderBuffer = new Uint8Array(8);
+    await databaseFileHandler.read(tablePageHeaderBuffer, 0, 8, tablePageOffset + tablePageHeaderOffset);
+    
+    const tablePageHeaderView = new DataView(tablePageHeaderBuffer.buffer);
+    const rowCount = tablePageHeaderView.getUint16(3);
+    
+    console.log(rowCount);
+    
+    await databaseFileHandler.close();
+
 } else {
     throw new Error(`Unknown command ${command}`);
 }
