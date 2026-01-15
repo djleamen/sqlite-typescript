@@ -671,6 +671,7 @@ if (command === ".dbinfo") {
     
     // Try to use index scan if WHERE clause matches an indexed column
     let rows: Array<{ rowid: number, values: string[] }> = [];
+    let usedIndex = false;
     
     if (whereColumn === 'country' && whereValue) {
         // Try to find and use the index on country column
@@ -681,11 +682,14 @@ if (command === ".dbinfo") {
             // Scan the index for matching rowids
             const matchingRowids = await scanIndex(databaseFileHandler, pageSize, indexRootPage, whereValue);
             
-            // Create a Set for O(1) lookup during table scan
-            const rowidSet = new Set(matchingRowids);
-            
-            // Do a single pass table scan, only collecting matching rows
-            await readTableCellsFiltered(databaseFileHandler, pageSize, rootPage, rowidSet, rows);
+            // Fetch each matching row directly by rowid (much faster than table scan)
+            for (const rowid of matchingRowids) {
+                const row = await fetchRowByRowid(databaseFileHandler, pageSize, rootPage, rowid);
+                if (row) {
+                    rows.push(row);
+                }
+            }
+            usedIndex = true;
         } catch (e) {
             // Index not found, fall back to full table scan
             rows = await readTableCells(databaseFileHandler, pageSize, rootPage);
@@ -698,7 +702,7 @@ if (command === ".dbinfo") {
     // Filter and print the requested columns
     rows.forEach(row => {
         // Apply WHERE filter if present and we didn't use index scan
-        if (whereColumn && whereValue && whereColumn !== 'country') {
+        if (whereColumn && whereValue && !usedIndex) {
             const actualValue = whereUsesRowid ? row.rowid.toString() : row.values[whereColumnIndex];
             if (actualValue !== whereValue) {
                 return;
