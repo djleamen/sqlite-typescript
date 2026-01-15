@@ -462,23 +462,107 @@ async function scanIndexRecursive(fileHandler: FileHandle, pageSize: number, pag
             }
         }
     } else if (pageType === 0x02) {
-        // Index interior page - traverse all children for now
-        // TODO: Could optimize by reading first key of each child and skipping non-matching subtrees
+        // Index interior page - optimize by only traversing relevant subtrees
         const cellCount = await readPageHeader(fileHandler, pageOffset, isPage1);
         const cellPointers = await readCellPointers(fileHandler, pageOffset, isPage1, cellCount, true);
         
-        // Read each cell to get left child pointers
+        let foundGreaterKey = false;
+        
+        // Read each cell and check the key to decide which children to traverse
         for (const cellOffset of cellPointers) {
-            const cellBuffer = new Uint8Array(16);
-            await fileHandler.read(cellBuffer, 0, 16, pageOffset + cellOffset);
+            const cellBuffer = new Uint8Array(1000);
+            await fileHandler.read(cellBuffer, 0, cellBuffer.length, pageOffset + cellOffset);
             
             const leftChildPage = new DataView(cellBuffer.buffer).getUint32(0, false);
-            await scanIndexRecursive(fileHandler, pageSize, leftChildPage, searchValue, rowids);
+            
+            // Parse the key (first indexed value) from this interior cell
+            let offset = 4; // Skip left child pointer
+            
+            // Read payload size
+            const [payloadSize, payloadSizeBytes] = readVarint(cellBuffer, offset);
+            offset += payloadSizeBytes;
+            
+            // Read header size
+            const [headerSize, headerSizeBytes] = readVarint(cellBuffer, offset);
+            offset += headerSizeBytes;
+            
+            // Read serial types
+            const serialTypes: number[] = [];
+            const headerStart = offset - headerSizeBytes;
+            while (offset - headerStart < headerSize) {
+                const [serialType, serialTypeBytes] = readVarint(cellBuffer, offset);
+                serialTypes.push(serialType);
+                offset += serialTypeBytes;
+            }
+            
+            // Read first value (the key)
+            if (serialTypes.length >= 1) {
+                const firstSerialType = serialTypes[0];
+                const size = getSerialTypeSize(firstSerialType);
+                
+                let keyValue = '';
+                if (firstSerialType === 0) {
+                    keyValue = '';
+                } else if (firstSerialType === 8) {
+                    keyValue = '0';
+                } else if (firstSerialType === 9) {
+                    keyValue = '1';
+                } else if (firstSerialType >= 1 && firstSerialType <= 6) {
+                    const view = new DataView(cellBuffer.buffer, cellBuffer.byteOffset + offset, size);
+                    let intValue = 0;
+                    
+                    if (size === 1) {
+                        intValue = view.getInt8(0);
+                    } else if (size === 2) {
+                        intValue = view.getInt16(0, false);
+                    } else if (size === 3) {
+                        const byte0 = cellBuffer[offset];
+                        const byte1 = cellBuffer[offset + 1];
+                        const byte2 = cellBuffer[offset + 2];
+                        intValue = (byte0 << 16) | (byte1 << 8) | byte2;
+                        if (intValue & 0x800000) {
+                            intValue |= 0xFF000000;
+                        }
+                    } else if (size === 4) {
+                        intValue = view.getInt32(0, false);
+                    } else if (size === 6) {
+                        const high = view.getInt16(0, false);
+                        const low = view.getUint32(2, false);
+                        intValue = (high * 0x100000000) + low;
+                    } else if (size === 8) {
+                        intValue = Number(view.getBigInt64(0, false));
+                    }
+                    
+                    keyValue = intValue.toString();
+                } else if (firstSerialType === 7) {
+                    const view = new DataView(cellBuffer.buffer, cellBuffer.byteOffset + offset, 8);
+                    const floatValue = view.getFloat64(0, false);
+                    keyValue = floatValue.toString();
+                } else {
+                    // TEXT or BLOB
+                    keyValue = new TextDecoder().decode(cellBuffer.slice(offset, offset + size));
+                }
+                
+                // Compare key with search value
+                // The left child contains all entries < keyValue
+                // If searchValue <= keyValue, we need to check left child
+                if (searchValue <= keyValue) {
+                    await scanIndexRecursive(fileHandler, pageSize, leftChildPage, searchValue, rowids);
+                }
+                
+                // If we've seen a key greater than searchValue, we can stop
+                if (searchValue < keyValue) {
+                    foundGreaterKey = true;
+                    break;
+                }
+            }
         }
         
-        // Read the rightmost child pointer
-        const rightmostChild = await readRightmostPointer(fileHandler, pageOffset, isPage1);
-        await scanIndexRecursive(fileHandler, pageSize, rightmostChild, searchValue, rowids);
+        // Only traverse rightmost child if we haven't found a greater key
+        if (!foundGreaterKey) {
+            const rightmostChild = await readRightmostPointer(fileHandler, pageOffset, isPage1);
+            await scanIndexRecursive(fileHandler, pageSize, rightmostChild, searchValue, rowids);
+        }
     }
 }
 
