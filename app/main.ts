@@ -245,6 +245,49 @@ async function readTableCells(fileHandler: FileHandle, pageSize: number, rootPag
     return rows;
 }
 
+// Read cells from a table page, filtering by rowid set
+async function readTableCellsFiltered(fileHandler: FileHandle, pageSize: number, rootPage: number, rowidSet: Set<number>, rows: Array<{ rowid: number, values: string[] }>): Promise<void> {
+    await readTableCellsFilteredRecursive(fileHandler, pageSize, rootPage, rowidSet, rows);
+}
+
+// Recursive helper to traverse B-tree and collect filtered rows
+async function readTableCellsFilteredRecursive(fileHandler: FileHandle, pageSize: number, pageNum: number, rowidSet: Set<number>, rows: Array<{ rowid: number, values: string[] }>): Promise<void> {
+    const pageOffset = (pageNum - 1) * pageSize;
+    const isPage1 = pageNum === 1;
+    
+    const pageType = await readPageType(fileHandler, pageOffset, isPage1);
+    
+    if (pageType === 0x0d) {
+        // Leaf page - read cells and filter
+        const cellCount = await readPageHeader(fileHandler, pageOffset, isPage1);
+        const cellPointers = await readCellPointers(fileHandler, pageOffset, isPage1, cellCount, false);
+        
+        for (const cellOffset of cellPointers) {
+            const cellBuffer = await readCell(fileHandler, pageOffset, cellOffset);
+            const record = parseRecord(cellBuffer);
+            
+            if (rowidSet.has(record.rowid)) {
+                rows.push(record);
+            }
+        }
+    } else if (pageType === 0x05) {
+        // Interior page - traverse children
+        const cellCount = await readPageHeader(fileHandler, pageOffset, isPage1);
+        const cellPointers = await readCellPointers(fileHandler, pageOffset, isPage1, cellCount, true);
+        
+        for (const cellOffset of cellPointers) {
+            const cellBuffer = new Uint8Array(16);
+            await fileHandler.read(cellBuffer, 0, 16, pageOffset + cellOffset);
+            
+            const leftChildPage = new DataView(cellBuffer.buffer).getUint32(0, false);
+            await readTableCellsFilteredRecursive(fileHandler, pageSize, leftChildPage, rowidSet, rows);
+        }
+        
+        const rightmostChild = await readRightmostPointer(fileHandler, pageOffset, isPage1);
+        await readTableCellsFilteredRecursive(fileHandler, pageSize, rightmostChild, rowidSet, rows);
+    }
+}
+
 // Recursive helper to traverse B-tree and collect all rows
 async function readTableCellsRecursive(fileHandler: FileHandle, pageSize: number, pageNum: number, rows: Array<{ rowid: number, values: string[] }>): Promise<void> {
     const pageOffset = (pageNum - 1) * pageSize;
@@ -327,19 +370,19 @@ async function scanIndexRecursive(fileHandler: FileHandle, pageSize: number, pag
                 offset += serialTypeBytes;
             }
             
-            // Read values - for a single-column index, we have: [indexed_value, rowid]
-            const values: string[] = [];
-            for (const serialType of serialTypes) {
-                const size = getSerialTypeSize(serialType);
+            // Read first value (indexed column) to check if it matches
+            if (serialTypes.length >= 2) {
+                const firstSerialType = serialTypes[0];
+                const size = getSerialTypeSize(firstSerialType);
                 
-                if (serialType === 0) {
-                    values.push('');
-                } else if (serialType === 8) {
-                    values.push('0');
-                } else if (serialType === 9) {
-                    values.push('1');
-                } else if (serialType >= 1 && serialType <= 6) {
-                    // Integer
+                let indexedValue = '';
+                if (firstSerialType === 0) {
+                    indexedValue = '';
+                } else if (firstSerialType === 8) {
+                    indexedValue = '0';
+                } else if (firstSerialType === 9) {
+                    indexedValue = '1';
+                } else if (firstSerialType >= 1 && firstSerialType <= 6) {
                     const view = new DataView(cellBuffer.buffer, cellBuffer.byteOffset + offset, size);
                     let intValue = 0;
                     
@@ -365,33 +408,62 @@ async function scanIndexRecursive(fileHandler: FileHandle, pageSize: number, pag
                         intValue = Number(view.getBigInt64(0, false));
                     }
                     
-                    values.push(intValue.toString());
-                    offset += size;
-                } else if (serialType === 7) {
+                    indexedValue = intValue.toString();
+                } else if (firstSerialType === 7) {
                     const view = new DataView(cellBuffer.buffer, cellBuffer.byteOffset + offset, 8);
                     const floatValue = view.getFloat64(0, false);
-                    values.push(floatValue.toString());
-                    offset += size;
+                    indexedValue = floatValue.toString();
                 } else {
                     // TEXT or BLOB
-                    const value = new TextDecoder().decode(cellBuffer.slice(offset, offset + size));
-                    values.push(value);
-                    offset += size;
+                    indexedValue = new TextDecoder().decode(cellBuffer.slice(offset, offset + size));
                 }
-            }
-            
-            // First value is the indexed column, last value is the rowid
-            if (values.length >= 2) {
-                const indexedValue = values[0];
-                const rowid = parseInt(values[values.length - 1]);
                 
+                // Only extract rowid if the indexed value matches
                 if (indexedValue === searchValue) {
-                    rowids.push(rowid);
+                    // Skip to the last serial type to get rowid
+                    offset += size;
+                    for (let i = 1; i < serialTypes.length - 1; i++) {
+                        offset += getSerialTypeSize(serialTypes[i]);
+                    }
+                    
+                    // Read rowid (last value)
+                    const rowidSerialType = serialTypes[serialTypes.length - 1];
+                    const rowidSize = getSerialTypeSize(rowidSerialType);
+                    
+                    if (rowidSerialType >= 1 && rowidSerialType <= 6) {
+                        const view = new DataView(cellBuffer.buffer, cellBuffer.byteOffset + offset, rowidSize);
+                        let rowid = 0;
+                        
+                        if (rowidSize === 1) {
+                            rowid = view.getInt8(0);
+                        } else if (rowidSize === 2) {
+                            rowid = view.getInt16(0, false);
+                        } else if (rowidSize === 3) {
+                            const byte0 = cellBuffer[offset];
+                            const byte1 = cellBuffer[offset + 1];
+                            const byte2 = cellBuffer[offset + 2];
+                            rowid = (byte0 << 16) | (byte1 << 8) | byte2;
+                            if (rowid & 0x800000) {
+                                rowid |= 0xFF000000;
+                            }
+                        } else if (rowidSize === 4) {
+                            rowid = view.getInt32(0, false);
+                        } else if (rowidSize === 6) {
+                            const high = view.getInt16(0, false);
+                            const low = view.getUint32(2, false);
+                            rowid = (high * 0x100000000) + low;
+                        } else if (rowidSize === 8) {
+                            rowid = Number(view.getBigInt64(0, false));
+                        }
+                        
+                        rowids.push(rowid);
+                    }
                 }
             }
         }
     } else if (pageType === 0x02) {
-        // Index interior page - for now, traverse all children (not implementing binary search)
+        // Index interior page - traverse all children for now
+        // TODO: Could optimize by reading first key of each child and skipping non-matching subtrees
         const cellCount = await readPageHeader(fileHandler, pageOffset, isPage1);
         const cellPointers = await readCellPointers(fileHandler, pageOffset, isPage1, cellCount, true);
         
@@ -609,13 +681,11 @@ if (command === ".dbinfo") {
             // Scan the index for matching rowids
             const matchingRowids = await scanIndex(databaseFileHandler, pageSize, indexRootPage, whereValue);
             
-            // Fetch each matching row by rowid
-            for (const rowid of matchingRowids) {
-                const row = await fetchRowByRowid(databaseFileHandler, pageSize, rootPage, rowid);
-                if (row) {
-                    rows.push(row);
-                }
-            }
+            // Create a Set for O(1) lookup during table scan
+            const rowidSet = new Set(matchingRowids);
+            
+            // Do a single pass table scan, only collecting matching rows
+            await readTableCellsFiltered(databaseFileHandler, pageSize, rootPage, rowidSet, rows);
         } catch (e) {
             // Index not found, fall back to full table scan
             rows = await readTableCells(databaseFileHandler, pageSize, rootPage);
